@@ -1,61 +1,38 @@
-using Azure.Identity;
-using Azure.Security.KeyVault.Secrets;
-using EncryptionDecryptionUsingSymmetricKey;
-using nfapinet;
-using pfapinet;
 using System;
 using System.Collections;
-using System.Collections.Specialized;
-using System.ComponentModel.Composition.Primitives;
-using System.Diagnostics.Metrics;
-using System.Dynamic;
-using System.IO;
+using System.Text;
+using pfapinet;
+using nfapinet;
+using System.Runtime.InteropServices;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
-using System.Security.Policy;
-using System.ServiceModel.Security;
-using System.Text;
-using System.Text.RegularExpressions;
-using System.Windows.Forms;
-using System.Xml.Linq;
-using static System.Windows.Forms.VisualStyles.VisualStyleElement;
-
-
-
+using System.Collections.Specialized;
+using System.IO;
 
 namespace PFNetFilterCS
 {
-
-
-
     enum ContentFilterParam
     {
-        CFP_FILTER_SSL, //ssl
-        CFP_FILTER_RAW, // raw
-        CFP_URL_STOP_NT8, // URL stop word
-
+        CFP_FILTER_SSL,
+        CFP_FILTER_RAW,
+        CFP_HTML_STOP_WORD,
+        CFP_URL_STOP_WORD,
+        CFP_BLOCK_PAGE,
+        CFP_SKIP_DOMAIN,
+        CFP_BLOCK_IMAGES,
+        CFP_BLOCK_FLV,
+        CFP_BLOCK_ADDRESS,
+        CFP_MAIL_PREFIX,
+        CFP_BLOCK_ICQ_UIN,
+        CFP_BLOCK_ICQ_STRING,
+        CFP_BLOCK_ICQ_FILE_TRANSFERS
     };
-
-
 
     class Filter : PFEventsDefault
     {
         private Form1 m_form = null;
+
         private Hashtable m_params = new Hashtable();
-
-        
-
-
-
-        // Custom HTTP Response Content body
-        static string CustomRsp = "If you See **12345** Then its means Custom Response is Working";
-
-
-
-
-
-
 
         public override void tcpConnected(ulong id, NF_TCP_CONN_INFO pConnInfo)
         {
@@ -352,24 +329,58 @@ namespace PFNetFilterCS
             return url;
         }
 
-
-        //******  Custom Response For CFP_URL_STOP_NT8
         void postBlockHttpResponse(ulong id)
-
         {
+            string blockPage;
+
+            lock (m_params)
+            {
+                blockPage = (string)m_params[ContentFilterParam.CFP_BLOCK_PAGE];
+            }
+
             PFObject obj = PFObject.create(PF_ObjectType.OT_HTTP_RESPONSE, 3);
 
-            saveString(obj.getStream((int)PF_HttpStream.HS_STATUS), "HTTP/1.1 200 OK\r\n", true);
+            saveString(obj.getStream((int)PF_HttpStream.HS_STATUS), "HTTP/1.1 404 Not OK\r\n", true);
 
             PFHeader h = new PFHeader();
             h.Add("Content-Type", "text/html");
-            h.Add("Content-Length", Convert.ToString(CustomRsp.Length));
+            h.Add("Content-Length", Convert.ToString(blockPage.Length));
             h.Add("Connection", "close");
-
 
             PFAPI.pf_writeHeader(obj.getStream((int)PF_HttpStream.HS_HEADER), h);
 
-            saveString(obj.getStream((int)PF_HttpStream.HS_CONTENT), CustomRsp, true); 
+            saveString(obj.getStream((int)PF_HttpStream.HS_CONTENT), blockPage, true);
+
+            PFAPI.pf_postObject(id, ref obj);
+
+            obj.free();
+        }
+
+        void postBlockHttp2Response(ulong id, PFObject origObject)
+        {
+            string blockPage;
+
+            lock (m_params)
+            {
+                blockPage = (string)m_params[ContentFilterParam.CFP_BLOCK_PAGE];
+            }
+
+            PFObject obj = PFObject.create(PF_ObjectType.OT_HTTP2_RESPONSE, 3);
+
+            PFStream origStream = origObject.getStream((int)PF_Http2Stream.H2S_INFO);
+            PFStream stream = obj.getStream((int)PF_Http2Stream.H2S_INFO);
+            // Copy stream id
+            origStream.copyTo(ref stream);
+
+            PFHeader h = new PFHeader();
+            h.Add(":status", "404");
+            h.Add("content-type", "text/html");
+            h.Add("content-length", Convert.ToString(blockPage.Length));
+            h.Add("connection", "close");
+
+            PFAPI.pf_writeHeader(obj.getStream((int)PF_Http2Stream.H2S_HEADER), h);
+
+            saveString(obj.getStream((int)PF_Http2Stream.H2S_CONTENT), blockPage, true);
 
             PFAPI.pf_postObject(id, ref obj);
 
@@ -378,20 +389,149 @@ namespace PFNetFilterCS
 
 
 
+        unsafe bool filterHTTPResponse(ulong id, PFObject pObject)
+        {
+            bool block = false;
+
+            // Read headers
+            PFHeader h = PFAPI.pf_readHeader(pObject.getStream((int)PF_HttpStream.HS_HEADER));
+            string contentType = h["Content-Type"];
+
+            // Filter HTML content
+            if (contentType != null && contentType.Contains("text/html"))
+            {
+                string htmlStopWord;
+                lock (m_params)
+                {
+                    htmlStopWord = (string)m_params[ContentFilterParam.CFP_HTML_STOP_WORD];
+                }
+
+                if (!string.IsNullOrEmpty(htmlStopWord))
+                {
+                    htmlStopWord = htmlStopWord.ToLower();
+                    string html = loadString(pObject.getStream((int)PF_HttpStream.HS_CONTENT), true).ToLower();
+                    if (html.Contains(htmlStopWord))
+                    {
+                        block = true;
+                    }
+                }
+            }
+
+
+           
+            // Filter JSON content
+            if (contentType != null && contentType.Contains("application/json"))
+            { 
+             
+                   
+                PFAPI.pf_unzipStream(pObject.getStream((int)PF_HttpStream.HS_CONTENT));
+                h.Remove("Content-Encoding");
+             
+                string jsonStopWord;
+                lock (m_params)
+                {
+                    jsonStopWord = (string)m_params[ContentFilterParam.CFP_HTML_STOP_WORD];
+                }
+
+                if (!string.IsNullOrEmpty(jsonStopWord))
+                {
+                    jsonStopWord = jsonStopWord.ToLower();
+                    string jsonContent = loadString(pObject.getStream((int)PF_HttpStream.HS_CONTENT), true).ToLower();
+
+                    if (jsonContent.Contains(jsonStopWord))
+                    {
+                        block = true;
+                    }
+                }
+            }
+
+            // Handle blocking
+            if (block)
+            {
+                if (pObject.getType() == PF_ObjectType.OT_HTTP_RESPONSE)
+                {
+                    postBlockHttpResponse(id);
+                }
+                else if (pObject.getType() == PF_ObjectType.OT_HTTP2_RESPONSE)
+                {
+                    postBlockHttp2Response(id, pObject);
+                }
+            }
+
+            return block;
+        }
+
+
+
+
+
+        //unsafe bool filterHTTPResponse(ulong id, PFObject pObject)
+        //{
+        //    bool block = false;
+
+        //    PFHeader h = PFAPI.pf_readHeader(pObject.getStream((int)PF_HttpStream.HS_HEADER));
+
+        //    string contentType = h["Content-Type"];
+        //    if (contentType != null && contentType.Contains("text/html"))
+        //    {
+        //        string htmlStopWord;
+
+        //        lock (m_params)
+        //        {
+        //            htmlStopWord = (string)m_params[ContentFilterParam.CFP_HTML_STOP_WORD];
+        //        }
+
+        //        if (htmlStopWord == null || htmlStopWord.Length == 0)
+        //            return false;
+
+        //        htmlStopWord = htmlStopWord.ToLower();
+
+        //        string html = loadString(pObject.getStream((int)PF_HttpStream.HS_CONTENT), true).ToLower();
+
+        //        if (html.Contains(htmlStopWord))
+        //        {
+        //            block = true;
+        //        }
+        //    }
+
+        //    if (block)
+        //    {
+        //        if (pObject.getType() == PF_ObjectType.OT_HTTP_RESPONSE)
+        //        {
+        //            postBlockHttpResponse(id);
+        //        }
+        //        else
+        //        if (pObject.getType() == PF_ObjectType.OT_HTTP2_RESPONSE)
+        //        {
+        //            postBlockHttp2Response(id, pObject);
+        //        }
+        //    }
+
+        //    return block;
+        //}
+
         bool filterHTTPRequest(ulong id, PFObject pObject)
         {
             bool block = false;
-            string urlStopWord;
-
+            string urlStopWord, skipDomain;
 
             lock (m_params)
             {
-                urlStopWord = (string)m_params[ContentFilterParam.CFP_URL_STOP_NT8];
-
+                urlStopWord = (string)m_params[ContentFilterParam.CFP_URL_STOP_WORD];
+                skipDomain = (string)m_params[ContentFilterParam.CFP_SKIP_DOMAIN];
             }
 
             string url = getHttpUrl(pObject).ToLower();
 
+            if (skipDomain != null && skipDomain.Length > 0)
+            {
+                skipDomain = skipDomain.ToLower();
+                if (url.IndexOf(skipDomain) != -1)
+                {
+                    // Allowed domain is found in URL.
+                    return false;
+                }
+            }
 
             if (urlStopWord != null && urlStopWord.Length > 0)
             {
@@ -399,22 +539,191 @@ namespace PFNetFilterCS
 
                 if (url.Contains(urlStopWord))
                 {
-
-                    postBlockHttpResponse(id); // If urlstopword "checkv2" is hit, modify with custom response
-
-
+                    postBlockHttp2Response(id, pObject);
                     block = true;
-
                 }
             }
 
-                return block;
+            return block;
+        }
+
+        bool filterOutgoingMail(ulong id, PFObject pObject)
+        {
+            bool block = false;
+            string blockAddress;
+
+            lock (m_params)
+            {
+                blockAddress = (string)m_params[ContentFilterParam.CFP_BLOCK_ADDRESS];
             }
-        
-    
+
+            if (blockAddress == null || blockAddress.Length == 0)
+                return false;
+
+            PFHeader h = PFAPI.pf_readHeader(pObject.getStream(0));
+            string toAddress = h["To"];
+            if (toAddress == null)
+            {
+                toAddress = h["Newsgroups"];
+            }
+
+            if (toAddress != null)
+            {
+                if (toAddress.ToLower().Contains(blockAddress))
+                {
+                    PFObject obj = PFObject.create(PF_ObjectType.OT_RAW_INCOMING, 1);
+                    saveString(obj.getStream(0), "554 Message blocked!\r\n", true);
+                    PFAPI.pf_postObject(id, ref obj);
+                    block = true;
+                }
+            }
+
+            return block;
+        }
+
+        void filterIncomingMail(ulong id, PFObject pObject)
+        {
+            string mailPrefix;
+
+            lock (m_params)
+            {
+                mailPrefix = (string)m_params[ContentFilterParam.CFP_MAIL_PREFIX];
+            }
+
+            if (mailPrefix == null || mailPrefix.Length == 0)
+                return;
+
+            PFStream pStream = pObject.getStream(0);
+            PFHeader h = PFAPI.pf_readHeader(pStream);
+            string subject = h["Subject"];
+            if (subject != null)
+            {
+                string content = loadString(pStream, true);
+                int pos = content.IndexOf("\r\n\r\n");
+                if (pos != -1)
+                {
+                    h.Remove("Subject");
+                    h["Subject"] = mailPrefix + " " + subject;
+
+                    pStream.reset();
+
+                    PFAPI.pf_writeHeader(pStream, h);
+                    saveString(pStream, content.Substring(pos + 4), false);
+                }
+            }
+        }
+
+        unsafe void postBlockICQResponse(ulong id, PFObject obj)
+        {
+            PFStream pStream;
+            PFObject blockObj;
+
+            // Copy and post the modified content to destination
+
+            if (obj.getType() == PF_ObjectType.OT_ICQ_CHAT_MESSAGE_INCOMING)
+            {
+                blockObj = PFObject.create(PF_ObjectType.OT_ICQ_RESPONSE, 1);
+            }
+            else
+            if (obj.getType() == PF_ObjectType.OT_ICQ_CHAT_MESSAGE_OUTGOING)
+            {
+                blockObj = PFObject.create(PF_ObjectType.OT_ICQ_REQUEST, 1);
+            }
+            else
+                return;
+
+            pStream = obj.getStream(0);
+
+            byte[] buf = new byte[pStream.size()];
+
+            pStream.seek(0, (int)SeekOrigin.Begin);
+
+            fixed (byte* p = buf)
+            {
+                pStream.read((IntPtr)p, (uint)pStream.size());
+            }
+
+            if (buf.Length < 27)
+                return;
+
+            buf[26] = 0;
+
+            pStream = blockObj.getStream(0);
+
+            fixed (byte* p = buf)
+            {
+                pStream.write((IntPtr)p, (uint)buf.Length);
+            }
+
+            PFAPI.pf_postObject(id, ref blockObj);
+
+            blockObj.free();
+        }
+
+        bool filterICQMessage(ulong id, PFObject obj)
+        {
+            string blockUIN;
+            string blockString;
+            bool blockFileTransfers;
+
+            lock (m_params)
+            {
+                blockUIN = (string)m_params[ContentFilterParam.CFP_BLOCK_ICQ_UIN];
+                blockString = (string)m_params[ContentFilterParam.CFP_BLOCK_ICQ_STRING];
+                blockFileTransfers = (bool)m_params[ContentFilterParam.CFP_BLOCK_ICQ_FILE_TRANSFERS];
+            }
+
+            if (blockUIN != null && blockUIN.Length > 0)
+            {
+                string contactUIN = loadString(obj.getStream((int)PF_ICQStream.ICQS_CONTACT_UIN), true);
+                if (contactUIN == blockUIN)
+                {
+                    postBlockICQResponse(id, obj);
+                    return true;
+                }
+            }
+
+            int textFormat = loadInt(obj.getStream((int)PF_ICQStream.ICQS_TEXT_FORMAT), true);
+
+            if ((blockString != null && blockString.Length > 0))
+            {
+                string msgText = "";
+
+                if (textFormat == (int)PF_ICQTextFormat.ICQTF_UNICODE)
+                {
+                    msgText = loadUnicodeString(obj.getStream((int)PF_ICQStream.ICQS_TEXT), true);
+                }
+                else
+                if (textFormat == (int)PF_ICQTextFormat.ICQTF_UTF8)
+                {
+                    msgText = loadUTF8String(obj.getStream((int)PF_ICQStream.ICQS_TEXT), true);
+                }
+                else
+                if (textFormat == (int)PF_ICQTextFormat.ICQTF_ANSI)
+                {
+                    msgText = loadString(obj.getStream((int)PF_ICQStream.ICQS_TEXT), true);
+                }
+
+                if (msgText.ToLower().Contains(blockString.ToLower()))
+                {
+                    postBlockICQResponse(id, obj);
+                    return true;
+                }
+            }
+
+            if (blockFileTransfers)
+            {
+                if (textFormat == (int)PF_ICQTextFormat.ICQTF_FILE_TRANSFER)
+                {
+                    postBlockICQResponse(id, obj);
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         public override void dataAvailable(ulong id, ref PFObject pObject)
-
         {
             bool blocked = false;
             PFObject clone = pObject.detach();
@@ -427,12 +736,26 @@ namespace PFNetFilterCS
                 {
                     switch (pObject.getType())
                     {
-
+                        case PF_ObjectType.OT_HTTP_RESPONSE:
+                        case PF_ObjectType.OT_HTTP2_RESPONSE:
+                            blocked = filterHTTPResponse(id, clone);
+                            break;
                         case PF_ObjectType.OT_HTTP_REQUEST:
                         case PF_ObjectType.OT_HTTP2_REQUEST:
                             blocked = filterHTTPRequest(id, clone);
                             break;
-
+                        case PF_ObjectType.OT_SMTP_MAIL_OUTGOING:
+                        case PF_ObjectType.OT_NNTP_POST:
+                            blocked = filterOutgoingMail(id, clone);
+                            break;
+                        case PF_ObjectType.OT_POP3_MAIL_INCOMING:
+                        case PF_ObjectType.OT_NNTP_ARTICLE:
+                            filterIncomingMail(id, clone);
+                            break;
+                        case PF_ObjectType.OT_ICQ_CHAT_MESSAGE_OUTGOING:
+                        case PF_ObjectType.OT_ICQ_CHAT_MESSAGE_INCOMING:
+                            blocked = filterICQMessage(id, clone);
+                            break;
                     }
                 }
                 catch (Exception)
@@ -445,10 +768,8 @@ namespace PFNetFilterCS
 
             m_form.addObjectSafe(id, clone, blocked);
         }
+
         public override PF_DATA_PART_CHECK_RESULT dataPartAvailable(ulong id, ref PFObject pObject)
-
-
-
         {
             try
             {
@@ -463,13 +784,29 @@ namespace PFNetFilterCS
                     if (pObject.getStream((int)PF_HttpStream.HS_CONTENT).size() < 5)
                         return PF_DATA_PART_CHECK_RESULT.DPCR_MORE_DATA_REQUIRED;
 
+                    if (filterHTTPResponse(id, pObject))
+                    {
+                        // Response blocked
+                        return PF_DATA_PART_CHECK_RESULT.DPCR_BLOCK;
+                    }
+
                     PFHeader h = PFAPI.pf_readHeader(pObject.getStream((int)PF_HttpStream.HS_HEADER));
 
                     string contentType = h["Content-Type"];
                     if (contentType == null)
                         return PF_DATA_PART_CHECK_RESULT.DPCR_FILTER_READ_ONLY;
 
-
+                    if (contentType.Contains("text/html") ||
+                         contentType.Contains("application/json"))
+                    {
+                        // Switch to DPCR_FILTER mode if we must filter HTML
+                        lock (m_params)
+                        {
+                            string htmlStopWord = (string)m_params[ContentFilterParam.CFP_HTML_STOP_WORD];
+                            if (htmlStopWord != null && htmlStopWord.Length > 0)
+                                return PF_DATA_PART_CHECK_RESULT.DPCR_FILTER;
+                        }
+                    }
                 }
                 else
                     if (pObject.getType() == PF_ObjectType.OT_HTTP_REQUEST ||
@@ -488,6 +825,7 @@ namespace PFNetFilterCS
 
             return PF_DATA_PART_CHECK_RESULT.DPCR_FILTER_READ_ONLY;
         }
+
         public void setParam(ContentFilterParam type, object value)
         {
             lock (m_params)
@@ -495,6 +833,7 @@ namespace PFNetFilterCS
                 m_params[type] = value;
             }
         }
+
         public bool start(Form1 form)
         {
             m_form = form;
@@ -508,6 +847,7 @@ namespace PFNetFilterCS
 
             PFAPI.pf_setRootSSLCertSubject("NFSDK Sample CA");
 
+            string s = PFAPI.getRootSSLCertFileName();
 
             if (NFAPI.nf_init("netfilter2", PFAPI.pf_getNFEventHandler()) != 0)
             {
@@ -552,6 +892,7 @@ namespace PFNetFilterCS
 
             return true;
         }
+
         public void stop()
         {
             NFAPI.nf_free();
